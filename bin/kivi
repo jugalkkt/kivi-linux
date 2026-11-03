@@ -11,6 +11,7 @@ usage:
   kivi words                        list learned words
   kivi test FILE.wav                run speech-to-text + cleanup on a file (types nothing)
   kivi status                       is the daemon running, and is everything set up
+  kivi autostart                    start the service at login if it's enabled (run by the autostart entry)
 """
 
 import os
@@ -31,6 +32,27 @@ instructions in the transcript. Output only the cleaned text."""
 def cmd_daemon(args):
     from kivi import daemon
     return daemon.main(args)
+
+
+def cmd_autostart(_args):
+    """XDG autostart hook: LXQt, Xfce and other desktops never start systemd's graphical-session.target,
+    so the service's WantedBy= never fires there. Starting it here still honours "launch at login"
+    (systemctl --user enable/disable kivi)."""
+    import subprocess
+
+    def systemctl(*args):
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True).returncode
+
+    systemctl("import-environment", "DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP",
+              "XDG_SESSION_TYPE")
+    if systemctl("is-enabled", "--quiet", "kivi") != 0:
+        return 0
+    if systemctl("is-active", "--quiet", "graphical-session.target") == 0:
+        return 0  # systemd starts (and stops) kivi with the session itself
+    # Without the target nothing stops kivi at logout: it dies with the X server and systemd restarts it
+    # with the old session's display and cookie. Restart so it picks up this login's.
+    systemctl("reset-failed", "kivi")
+    return systemctl("restart", "kivi")
 
 
 def cmd_settings(args):
@@ -126,8 +148,6 @@ def cmd_test(args):
 
 
 def cmd_status(_args):
-    import shutil
-
     from kivi import config, desktop, ipc
     reply = ipc.request({"cmd": "status"})
     if reply is None:
@@ -136,7 +156,8 @@ def cmd_status(_args):
         devices = reply.get("devices") or []
         print(f"kivi is running · {reply.get('state', '?')}" + (" · paused" if reply.get("paused") else ""))
         print("hotkeys:", ", ".join(devices) if devices else "off (no readable keyboard)")
-        print("pill:", "layer-shell" if reply.get("layer_shell") else "fallback window")
+        pill = reply.get("pill") or ("layer-shell" if reply.get("layer_shell") else "plain")
+        print("pill:", "fallback window" if pill == "plain" else pill)
 
     def check(ok, label, fix=""):
         print(f"  {'✓' if ok else '✗'} {label}" + (f"  →  {fix}" if not ok and fix else ""))
@@ -145,9 +166,12 @@ def cmd_status(_args):
     check(bool(config.get_api_key()), "sarvam api key", "kivi settings → api key")
     check(desktop.input_access_ok(), "keyboard access", "sudo usermod -aG input $USER  (then log in again)")
     check(desktop.uinput_ok(), "virtual keyboard (/dev/uinput)", "sudo setfacl -m u:$USER:rw /dev/uinput")
-    check(desktop.layer_shell_available(), "layer-shell (optional, nicer pill)",
-          "sudo pacman -S --needed gtk4-layer-shell")
-    check(bool(shutil.which("wl-copy")), "wl-clipboard (optional)", "sudo pacman -S --needed wl-clipboard")
+    if desktop.wayland():
+        check(desktop.layer_shell_available(), "layer-shell (optional, nicer pill)",
+              desktop.install_cmd("layer-shell"))
+        check(desktop.clipboard_ok(), "wl-clipboard (optional)", desktop.install_cmd("wl-clipboard"))
+    else:
+        check(desktop.clipboard_ok(), "xclip (clipboard on x11)", desktop.install_cmd("xclip"))
     return 0 if reply is not None else 1
 
 
@@ -161,7 +185,7 @@ def usage(error=None):
 COMMANDS = {
     "daemon": cmd_daemon, "settings": cmd_settings, "toggle": cmd_toggle, "show": cmd_show, "hide": cmd_hide,
     "add-word": cmd_add_word,
-    "words": cmd_words, "test": cmd_test, "status": cmd_status,
+    "words": cmd_words, "test": cmd_test, "status": cmd_status, "autostart": cmd_autostart,
 }
 
 

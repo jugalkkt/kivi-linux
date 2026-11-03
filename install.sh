@@ -4,18 +4,26 @@ set -e
 cd "$(dirname "$0")"
 REPO=$PWD
 PY=/usr/bin/python3
+# the right package names and install command for this distro (apt, dnf or pacman)
+install_cmd() { $PY -c 'import sys; from kivi import desktop; print(desktop.install_cmd(*sys.argv[1:]))' "$@"; }
 
-missing_py=""
-$PY -c "import evdev" 2>/dev/null || missing_py="$missing_py python-evdev"
-$PY -c "import gi; gi.require_version('Gtk', '4.0'); from gi.repository import Gtk" 2>/dev/null || missing_py="$missing_py gtk4 python-gobject"
-$PY -c "import gi; gi.require_version('Adw', '1'); from gi.repository import Adw" 2>/dev/null || missing_py="$missing_py libadwaita"
-if [ -n "$missing_py" ]; then
-  echo "kivi needs:$missing_py"
-  echo "  sudo pacman -S --needed$missing_py"
+wayland=""
+[ -n "$WAYLAND_DISPLAY" ] && wayland=1
+
+needs=""
+$PY -c "import evdev" 2>/dev/null || needs="$needs evdev"
+$PY -c "import gi; gi.require_version('Gtk', '4.0'); from gi.repository import Gtk" 2>/dev/null || needs="$needs gtk4"
+$PY -c "import gi; gi.require_version('Adw', '1'); from gi.repository import Adw" 2>/dev/null || needs="$needs adwaita"
+# on X11 kivi pastes through xclip; wl-clipboard can't reach an X11 clipboard
+[ -z "$wayland" ] && ! command -v xclip >/dev/null 2>&1 && needs="$needs xclip"
+if [ -n "$needs" ]; then
+  echo "kivi needs a few packages first:"
+  echo "  $(install_cmd $needs)"
+  echo "then run ./install.sh again."
   exit 1
 fi
 
-mkdir -p ~/.local/bin ~/.config/systemd/user \
+mkdir -p ~/.local/bin ~/.config/systemd/user ~/.config/autostart \
   ~/.local/share/icons/hicolor/scalable/apps ~/.local/share/applications ~/.local/share/kivi
 mkdir -p -m 700 ~/.config/kivi
 
@@ -34,6 +42,8 @@ touch ~/.local/share/icons/hicolor
 gtk-update-icon-cache -q -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
 # absolute Exec: ~/.local/bin isn't always on the session PATH
 sed "s|^Exec=kivi |Exec=$HOME/.local/bin/kivi |" data/kivi.desktop > ~/.local/share/applications/ai.kivi.Linux.desktop
+# LXQt, Xfce and friends never start graphical-session.target, so the service also gets started from here
+sed "s|^Exec=kivi |Exec=$HOME/.local/bin/kivi |" data/kivi-autostart.desktop > ~/.config/autostart/ai.kivi.Linux.desktop
 update-desktop-database -q ~/.local/share/applications 2>/dev/null || true
 # KDE caches menu entries and icons in ksycoca; rebuild it so the menu picks up the icon now
 command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
@@ -53,8 +63,10 @@ systemctl --user restart kivi.service || echo "kivi did not start: journalctl --
 
 # --- what's still missing (all optional except keyboard access)
 pkgs=""
-[ -e /usr/lib/libgtk4-layer-shell.so ] || pkgs="$pkgs gtk4-layer-shell"
-command -v wl-copy >/dev/null 2>&1 || pkgs="$pkgs wl-clipboard"
+if [ -n "$wayland" ]; then
+  $PY -c "from kivi import desktop; exit(not desktop.layer_shell_available())" || pkgs="$pkgs layer-shell"
+  command -v wl-copy >/dev/null 2>&1 || pkgs="$pkgs wl-clipboard"
+fi
 
 input_ok=""
 for dev in /dev/input/event*; do
@@ -71,7 +83,7 @@ uinput_rule=""
 [ -f /etc/udev/rules.d/60-kivi-uinput.rules ] && uinput_rule=1
 
 fix=""
-[ -n "$pkgs" ] && fix="sudo pacman -S --needed$pkgs"
+[ -n "$pkgs" ] && fix="$(install_cmd $pkgs)"
 if [ -z "$in_group" ]; then
   [ -n "$fix" ] && fix="$fix && "
   fix="${fix}sudo usermod -aG input \$USER"

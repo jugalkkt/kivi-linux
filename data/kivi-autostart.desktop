@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=kivi
+Comment=starts kivi at login on desktops that don't start systemd's graphical session (LXQt, Xfce, ...)
+Exec=kivi autostart
+Icon=kivi
+Terminal=false
+NoDisplay=true
+X-LXQt-Need-Tray=true

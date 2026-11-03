@@ -14,7 +14,7 @@ systemctl --user reset-failed kivi.service 2>/dev/null || true
 pkill -f "kivi settings" 2>/dev/null || true
 
 rm -f ~/.local/bin/kivi
-rm -f ~/.local/share/applications/ai.kivi.Linux.desktop
+rm -f ~/.local/share/applications/ai.kivi.Linux.desktop ~/.config/autostart/ai.kivi.Linux.desktop
 rm -f ~/.local/share/icons/hicolor/scalable/apps/kivi.svg ~/.local/share/icons/hicolor/*/apps/kivi.png
 rm -rf ~/.local/share/fonts/kivi
 rm -rf "${XDG_RUNTIME_DIR:-/nonexistent}/kivi" "${XDG_RUNTIME_DIR:-/nonexistent}/kivi.sock"
