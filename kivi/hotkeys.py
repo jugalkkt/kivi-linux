@@ -292,7 +292,7 @@ class HotkeyListener(threading.Thread):
                 pointers.pop(dev.path, None)
         return want
 
-    def _handle(self, dev, opened, dropped):
+    def _handle_device(self, dev, opened, dropped):
         is_pointer = dev.path not in opened
         for ev in dev.read():
             if ev.type == ecodes.EV_SYN:
@@ -339,7 +339,7 @@ class HotkeyListener(threading.Thread):
                     for key, _ in sel.select(timeout=0.5):
                         dev = key.fileobj
                         try:
-                            self._handle(dev, opened, dropped)
+                            self._handle_device(dev, opened, dropped)
                         except BlockingIOError:
                             continue
                         except OSError:  # unplugged
