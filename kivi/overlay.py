@@ -4,11 +4,13 @@ listens (five green bars riding the mic level), thinks, and shows what it heard 
 Placement backends, best first:
   layer-shell  gtk4-layer-shell (needs the lib in LD_PRELOAD before Gtk loads; daemon.py does that)
   kwin         KDE without layer-shell: a KWin script pins/positions the window and hands focus back
+  x11          other X11 window managers (LXQt/Openbox, Xfce, ...): EWMH hints + Xlib placement
   plain        anything else: an undecorated window (callers should also notify)
 
 Run `python3 -m kivi.overlay --demo` to cycle through every state.
 """
 
+import ctypes
 import math
 import os
 import sys
@@ -33,6 +35,12 @@ try:
     from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
 except (ValueError, ImportError):
     LayerShell = None
+
+try:
+    gi.require_version("GdkX11", "4.0")
+    from gi.repository import GdkX11  # noqa: E402
+except (ValueError, ImportError):
+    GdkX11 = None
 
 CAPTION = "kivi-overlay"
 KWIN_PLUGIN = "kivi-overlay"
@@ -261,18 +269,241 @@ class KWinPlacer:
             pass
 
 
+# ------------------------------------------------------------------------------------- X11
+
+class _XClientMessage(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+                ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+                ("format", ctypes.c_int), ("l", ctypes.c_long * 5)]
+
+
+class _XEvent(ctypes.Union):
+    _fields_ = [("xclient", _XClientMessage), ("pad", ctypes.c_long * 24)]
+
+
+class _XWMHints(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_long), ("input", ctypes.c_int), ("initial_state", ctypes.c_int),
+                ("icon_pixmap", ctypes.c_ulong), ("icon_window", ctypes.c_ulong), ("icon_x", ctypes.c_int),
+                ("icon_y", ctypes.c_int), ("icon_mask", ctypes.c_ulong), ("window_group", ctypes.c_ulong)]
+
+
+class _XRectangle(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short), ("width", ctypes.c_ushort), ("height", ctypes.c_ushort)]
+
+
+class X11Placer:
+    """X11 window managers (Openbox, Xfwm, ...): EWMH hints keep the pill above everything, on every
+    desktop, out of the taskbar and never focused; kivi moves it to the bottom (or top) centre itself.
+
+    Uses its own Xlib connection: GTK's X error handler ignores errors on displays it didn't open,
+    so a stray BadWindow can't take the daemon down.
+    """
+
+    def __init__(self, win: Gtk.Window):
+        self.win = win
+        self._x = ctypes.CDLL("libX11.so.6")
+        self._xext = None
+        x = self._x
+        x.XOpenDisplay.restype = ctypes.c_void_p
+        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x.XInternAtom.restype = ctypes.c_ulong
+        x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x.XDefaultRootWindow.restype = ctypes.c_ulong
+        x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        x.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long,
+                                 ctypes.POINTER(_XEvent)]
+        x.XMoveWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
+        x.XGetWMHints.restype = ctypes.POINTER(_XWMHints)
+        x.XGetWMHints.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x.XSetWMHints.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_XWMHints)]
+        x.XSetWMProtocols.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_int]
+        x.XQueryPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong] + [ctypes.POINTER(ctypes.c_ulong)] * 2 + \
+            [ctypes.POINTER(ctypes.c_int)] * 4 + [ctypes.POINTER(ctypes.c_uint)]
+        x.XFree.argtypes = [ctypes.c_void_p]
+        x.XFlush.argtypes = [ctypes.c_void_p]
+        self._dpy = x.XOpenDisplay(None)
+        if not self._dpy:
+            raise OSError("can't open the X display")
+        self._root = x.XDefaultRootWindow(self._dpy)
+        self._xid = 0
+        self._pos = None
+        self._position, self._margin = "bottom", 0
+        self._shape = None
+        self._shape_key = ()
+        win.connect("realize", lambda w: self._prepare())
+        win.connect("map", lambda w: GLib.idle_add(self._setup))
+
+    @staticmethod
+    def available() -> bool:
+        display = Gdk.Display.get_default()
+        if GdkX11 is None or not isinstance(display, GdkX11.X11Display):
+            return False
+        try:
+            ctypes.CDLL("libX11.so.6")
+            return True
+        except OSError:
+            return False
+
+    def _atom(self, name) -> int:
+        return self._x.XInternAtom(self._dpy, name.encode(), False)
+
+    def _set_atoms(self, prop, type_, values):
+        arr = (ctypes.c_ulong * len(values))(*values)   # format-32 data is an array of C longs
+        self._x.XChangeProperty(self._dpy, self._xid, self._atom(prop), type_, 32, 0, arr, len(values))
+
+    def _message(self, type_, *data):
+        ev = _XEvent()
+        m = ev.xclient
+        m.type, m.send_event, m.display, m.window = 33, 1, self._dpy, self._xid   # 33 = ClientMessage
+        m.message_type, m.format = self._atom(type_), 32
+        for i, v in enumerate(data):
+            m.l[i] = v
+        mask = (1 << 19) | (1 << 20)   # SubstructureNotify | SubstructureRedirect
+        self._x.XSendEvent(self._dpy, self._root, False, mask, ctypes.byref(ev))
+
+    def _prepare(self):
+        """Before the window is mapped: what the WM reads once, when it first manages the window."""
+        surface = self.win.get_surface()
+        self._xid = GdkX11.X11Surface.get_xid(surface)
+        GdkX11.X11Surface.set_skip_taskbar_hint(surface, True)
+        GdkX11.X11Surface.set_skip_pager_hint(surface, True)
+        GdkX11.X11Surface.set_user_time(surface, 0)   # 0 = "don't focus me when mapped"
+        self._hints()
+        self._x.XFlush(self._dpy)
+
+    def _hints(self):
+        XA_ATOM, XA_CARDINAL = 4, 6
+        self._set_atoms("_NET_WM_WINDOW_TYPE", XA_ATOM, [self._atom("_NET_WM_WINDOW_TYPE_DOCK")])
+        self._set_atoms("_NET_WM_DESKTOP", XA_CARDINAL, [0xFFFFFFFF])
+        self._set_atoms("_COMPTON_SHADOW", XA_CARDINAL, [0])   # picom/compton: the pill draws its own
+        # never take keyboard focus: input=False and no WM_TAKE_FOCUS, so pastes land in the user's app
+        hints = self._x.XGetWMHints(self._dpy, self._xid)
+        h = _XWMHints() if not hints else _XWMHints.from_buffer_copy(hints.contents)
+        if hints:
+            self._x.XFree(hints)
+        h.flags |= 1   # InputHint
+        h.input = 0
+        self._x.XSetWMHints(self._dpy, self._xid, ctypes.byref(h))
+        protocols = (ctypes.c_ulong * 2)(self._atom("WM_DELETE_WINDOW"), self._atom("_NET_WM_PING"))
+        self._x.XSetWMProtocols(self._dpy, self._xid, protocols, 2)
+
+    def _setup(self):
+        """After mapping: GTK rewrites WM_HINTS and _NET_WM_STATE on show, so set them again now."""
+        if not self._xid:
+            return False
+        self._hints()
+        state = [self._atom(a) for a in ("_NET_WM_STATE_ABOVE", "_NET_WM_STATE_STICKY",
+                                         "_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER")]
+        for a, b in ((state[0], state[1]), (state[2], state[3])):
+            self._message("_NET_WM_STATE", 1, a, b, 1)   # 1 = _NET_WM_STATE_ADD, source = application
+        self._message("_NET_WM_DESKTOP", 0xFFFFFFFF, 1)
+        display = self.win.get_display()
+        display.connect("notify::composited", lambda *_: self.shape(self._shape, force=True))
+        display.get_monitors().connect("items-changed", lambda *_: self.place(force=True))
+        self._pos = None
+        self.place()
+        self.shape(self._shape, force=True)
+        return False
+
+    def load(self, position: str, margin: int):
+        self._position, self._margin = position, margin
+        self.place(force=True)
+
+    def _monitor(self, display):
+        """The monitor under the pointer (kivi follows you between screens), else the primary one."""
+        root_ret, child = ctypes.c_ulong(), ctypes.c_ulong()
+        rx, ry, wx, wy, mask = ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_uint()
+        scale = max(1, self.win.get_scale_factor())
+        monitors = display.get_monitors()
+        if self._x.XQueryPointer(self._dpy, self._root, ctypes.byref(root_ret), ctypes.byref(child),
+                                 ctypes.byref(rx), ctypes.byref(ry), ctypes.byref(wx), ctypes.byref(wy),
+                                 ctypes.byref(mask)):
+            px, py = rx.value / scale, ry.value / scale
+            for i in range(monitors.get_n_items()):
+                m = monitors.get_item(i)
+                g = m.get_geometry()
+                if g.x <= px < g.x + g.width and g.y <= py < g.y + g.height:
+                    return m
+        return display.get_primary_monitor() or (monitors.get_item(0) if monitors.get_n_items() else None)
+
+    def place(self, force=False):
+        if not self._xid:
+            return
+        display = self.win.get_display()
+        monitor = self._monitor(display)
+        if monitor is None:
+            return
+        try:
+            area = GdkX11.X11Monitor.get_workarea(monitor)   # minus panels
+        except (AttributeError, TypeError):
+            area = monitor.get_geometry()
+        scale = max(1, self.win.get_scale_factor())
+        x = area.x + (area.width - WIN_W) // 2
+        y = area.y + self._margin if self._position == "top" else area.y + area.height - WIN_H - self._margin
+        pos = (x * scale, y * scale)
+        if pos != self._pos or force:
+            self._pos = pos
+            self._x.XMoveWindow(self._dpy, self._xid, *pos)
+            self._x.XFlush(self._dpy)
+
+    def shape(self, shapes, force=False):
+        """Without a compositor transparent pixels show up black, so clip the window to what's drawn.
+
+        `shapes` is a list of (x, y, w, h, radius) in window coordinates; corners are cut in 1px rows.
+        """
+        self._shape = shapes
+        if not self._xid or shapes is None:
+            return
+        composited = self.win.get_display().is_composited()
+        key = None if composited else tuple(shapes)
+        if key == self._shape_key and not force:
+            return
+        self._shape_key = key
+        if self._xext is None:
+            try:
+                self._xext = ctypes.CDLL("libXext.so.6")
+            except OSError:
+                self._xext = False
+        if not self._xext:
+            return
+        bounding, op_set = 0, 0
+        if composited:   # back to the plain rectangle; picom blends the transparency
+            self._xext.XShapeCombineMask(ctypes.c_void_p(self._dpy), ctypes.c_ulong(self._xid), bounding, 0, 0,
+                                         ctypes.c_ulong(0), op_set)
+        else:
+            scale = max(1, self.win.get_scale_factor())
+            rows = []
+            for sx, sy, sw, sh, r in shapes:
+                sx, sy, sw, sh, r = (int(round(v * scale)) for v in (sx, sy, sw, sh, r))
+                r = max(0, min(r, sw // 2, sh // 2))
+                for i in range(r):   # the rounded rows at the top and bottom of each shape
+                    inset = r - int(math.sqrt(max(0, r * r - (r - i - 0.5) ** 2)))
+                    rows.append((sx + inset, sy + i, sw - 2 * inset, 1))
+                    rows.append((sx + inset, sy + sh - 1 - i, sw - 2 * inset, 1))
+                rows.append((sx, sy + r, sw, sh - 2 * r))
+            rows = [r for r in rows if r[2] > 0 and r[3] > 0]
+            rects = (_XRectangle * max(1, len(rows)))(*[_XRectangle(*r) for r in rows])
+            self._xext.XShapeCombineRectangles(ctypes.c_void_p(self._dpy), ctypes.c_ulong(self._xid), bounding,
+                                               0, 0, rects, len(rows), op_set, 0)
+        self._x.XFlush(self._dpy)
+
+
 def _pick_backend() -> str:
     forced = os.environ.get("KIVI_OVERLAY_BACKEND", "").strip().lower()
     wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
     layer_ok = (LayerShell is not None and wayland and LAYER_LIB in os.environ.get("LD_PRELOAD", "")
                 and LayerShell.is_supported())
-    if forced in ("layer-shell", "kwin", "plain"):
+    if forced in ("layer-shell", "kwin", "x11", "plain"):
         if forced != "layer-shell" or layer_ok:
             return forced
     if layer_ok:
         return "layer-shell"
     if "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper() and KWinPlacer.available():
         return "kwin"
+    if X11Placer.available():
+        return "x11"
     return "plain"
 
 
@@ -284,7 +515,7 @@ class Overlay:
         self.on_click = on_click
         self.on_menu = on_menu
         self.backend = _pick_backend()
-        self.available = self.backend in ("layer-shell", "kwin")  # False => caller should also notify
+        self.available = self.backend in ("layer-shell", "kwin", "x11")  # False => caller should also notify
         self.paused = False
         self.hint = ""             # e.g. "no keyboard access" set by the daemon
         self._user_hidden = False
@@ -399,6 +630,7 @@ class Overlay:
         win.set_can_focus(False)
         win.set_deletable(False)
 
+        self._x11 = X11Placer(win) if self.backend == "x11" else None
         if self.backend == "layer-shell":
             LayerShell.init_for_window(win)
             LayerShell.set_namespace(win, "kivi")
@@ -447,6 +679,8 @@ class Overlay:
                                   self._edge_margin())
         elif self._kwin and self.win.get_realized():
             self._kwin.load(self._position, self._edge_margin())
+        elif self._x11:
+            self._x11.load(self._position, self._edge_margin())
 
     def _card_box(self) -> Gtk.Box:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, halign=Gtk.Align.CENTER)
@@ -624,7 +858,23 @@ class Overlay:
         if key != self._region:
             self._region = key
             surface.set_input_region(cairo.Region([cairo.RectangleInt(*r) for r in rects]))
+        if self._x11:
+            self._x11.shape(self._shapes())
         return False
+
+    def _shapes(self):
+        """What's painted, as (x, y, w, h, radius): the X11 window is clipped to it without a compositor."""
+        shapes = []
+        if self._alpha.value > 0.01:
+            x, y, w, h = self._pill_rect()
+            shapes.append((x, y, w, h, h / 2))
+        if self._card_a.value > 0.01 and self._card:
+            card = self.reply_card if self._card == "reply" else self.menu_card
+            ok, b = card.compute_bounds(self.win)
+            if ok:
+                shapes.append((b.get_x(), b.get_y(), b.get_width(), b.get_height(),
+                               20 if self._card == "reply" else 14))
+        return shapes
 
     # -- timers -------------------------------------------------------------------------------
 
@@ -714,6 +964,8 @@ class Overlay:
                 self._text = data.get("message", "something went wrong")
                 self._later("transient", 3000, self._end_transient)
         self.state = state
+        if self._x11 and prev == "idle" and state != "idle":
+            self._x11.place()
 
         w, h = self._measure()
         shown = self._enabled and (state != "idle" or (self._idle_style != "hidden" and not self._user_hidden))
@@ -1054,13 +1306,14 @@ def _demo(argv):
     only = None
     if "--state" in argv:
         only = argv[argv.index("--state") + 1]
-    lib = "/usr/lib/libgtk4-layer-shell.so"
-    if ("--no-layer-shell" not in argv and os.path.exists(lib) and LAYER_LIB not in os.environ.get("LD_PRELOAD", "")
+    from .desktop import layer_shell_lib, wayland
+    lib = layer_shell_lib()
+    if ("--no-layer-shell" not in argv and lib and wayland() and LAYER_LIB not in os.environ.get("LD_PRELOAD", "")
             and not os.environ.get("KIVI_PRELOADED")):
         env = dict(os.environ, LD_PRELOAD=f"{lib}:{os.environ.get('LD_PRELOAD', '')}".rstrip(":"),
                    KIVI_PRELOADED="1")
         os.execve(sys.executable, [sys.executable, "-m", "kivi.overlay", *argv], env)
-    if "--no-layer-shell" in argv and not os.environ.get("KIVI_OVERLAY_BACKEND"):
+    if "--no-layer-shell" in argv and wayland() and not os.environ.get("KIVI_OVERLAY_BACKEND"):
         os.environ["KIVI_OVERLAY_BACKEND"] = "kwin"
 
     app = Gtk.Application(application_id="ai.kivi.Linux.OverlayDemo", flags=Gio.ApplicationFlags.NON_UNIQUE)
