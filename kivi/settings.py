@@ -57,6 +57,19 @@ def _safe(fn, *args, default=None, **kwargs):
         return default
 
 
+def wrap_box(spacing, **kw):
+    """Adw.WrapBox (libadwaita 1.7+), else a Gtk.FlowBox doing the same job (Ubuntu 24.04 has 1.5)."""
+    if hasattr(Adw, "WrapBox"):
+        return Adw.WrapBox(child_spacing=spacing, line_spacing=spacing, **kw)
+    return Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=spacing, row_spacing=spacing,
+                       max_children_per_line=24, halign=Gtk.Align.START, **kw)
+
+
+def spinner(**kw):
+    """Adw.Spinner (libadwaita 1.6+), else the plain Gtk one."""
+    return Adw.Spinner(**kw) if hasattr(Adw, "Spinner") else Gtk.Spinner(spinning=True, **kw)
+
+
 def run_bg(work, done=None):
     """Run work() on a thread; done(result, error) back on the GTK thread."""
     def target():
@@ -127,8 +140,10 @@ PAGES = [
 FIX_INPUT = "sudo usermod -aG input $USER"
 FIX_INPUT_NOW = "sudo setfacl -m u:$USER:rw /dev/input/event*"
 FIX_UINPUT = "sudo setfacl -m u:$USER:rw /dev/uinput"
-FIX_LAYER_SHELL = "sudo pacman -S --needed gtk4-layer-shell"
-FIX_WL_CLIPBOARD = "sudo pacman -S --needed wl-clipboard"
+
+
+def _fix_install(*needs):
+    return desktop.install_cmd(*needs) if desktop else "install " + " ".join(needs)
 
 MODIFIERS = {"LEFTCTRL", "RIGHTCTRL", "LEFTSHIFT", "RIGHTSHIFT", "LEFTALT", "RIGHTALT",
              "LEFTMETA", "RIGHTMETA", "COMPOSE", "FN"}
@@ -858,7 +873,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.btn_start = button("start", "suggested-action", on_click=lambda: self._daemon("start"))
         self.btn_restart = button("restart", "kivi-ghost", on_click=lambda: self._daemon("restart"))
         self.btn_stop = button("stop", "kivi-ghost", on_click=lambda: self._daemon("stop"))
-        self.status_spin = Adw.Spinner(visible=False)
+        self.status_spin = spinner(visible=False)
         for w in (self.status_spin, self.btn_start, self.btn_restart, self.btn_stop):
             self.status_btns.append(w)
         self.status_row.add_suffix(self.status_btns)
@@ -920,7 +935,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             else:
                 sub = f"{state} · can't read your keyboard yet, see setup below"
                 self.status_dot.add_css_class("warn")
-            if not st.get("layer_shell", True):
+            if st.get("pill", "layer-shell" if st.get("layer_shell", True) else "plain") == "plain":
                 sub += " · basic pill"
             self.status_row.set_title("kivi is running")
             self.status_row.set_subtitle(sub)
@@ -994,7 +1009,8 @@ class SettingsWindow(Adw.ApplicationWindow):
             "input": _safe(getattr(d, "input_access_ok", None)),
             "uinput": _safe(getattr(d, "uinput_ok", None)),
             "layer": _safe(getattr(d, "layer_shell_available", None)),
-            "wl": bool(shutil.which("wl-copy") and shutil.which("wl-paste")),
+            "clip": _safe(getattr(d, "clipboard_ok", None)),
+            "wayland": bool(os.environ.get("WAYLAND_DISPLAY")),
         }
 
     def _render_checks(self, res, err):
@@ -1029,10 +1045,15 @@ class SettingsWindow(Adw.ApplicationWindow):
             [(FIX_INPUT, "then log out and back in"), (FIX_INPUT_NOW, "works right away, until reboot")])
         add(res.get("uinput"), "typing access", "kivi can type into any app",
             "kivi types through a virtual keyboard (/dev/uinput)", [(FIX_UINPUT, "until reboot")])
-        add(res.get("layer"), "layer-shell (optional)", "the pill floats above everything",
-            "nicer always-on-top pill on wayland", [(FIX_LAYER_SHELL, "then restart kivi")], optional=True)
-        add(res.get("wl"), "wl-clipboard (optional)", "fast clipboard on wayland",
-            "kivi falls back to klipper without it", [(FIX_WL_CLIPBOARD, "")], optional=True)
+        if res.get("wayland"):
+            add(res.get("layer"), "layer-shell (optional)", "the pill floats above everything",
+                "nicer always-on-top pill on wayland", [(_fix_install("layer-shell"), "then restart kivi")],
+                optional=True)
+            add(res.get("clip"), "wl-clipboard (optional)", "fast clipboard on wayland",
+                "kivi falls back to klipper without it", [(_fix_install("wl-clipboard"), "")], optional=True)
+        else:
+            add(res.get("clip"), "xclip", "kivi can use the clipboard",
+                "kivi pastes through the clipboard, which needs xclip on x11", [(_fix_install("xclip"), "")])
 
     # ============================================================ 2. api key
     def _page_api_key(self):
@@ -1049,7 +1070,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         actions.append(button("save", "suggested-action", on_click=self._save_key))
         self.test_btn = button("test key", "kivi-ghost", on_click=self._test_key)
         actions.append(self.test_btn)
-        self.key_spin = Adw.Spinner(visible=False, valign=Gtk.Align.CENTER)
+        self.key_spin = spinner(visible=False, valign=Gtk.Align.CENTER)
         actions.append(self.key_spin)
         self.key_result = label("", "kivi-ink-2", wrap=True, hexpand=True)
         actions.append(self.key_result)
@@ -1218,7 +1239,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         a.add(combo_row("speaking language", "", TTS_LANGUAGES, self.get("tts_language"),
                         lambda v: self.set("tts_language", v)))
         prev = Adw.ActionRow(title="preview voice", subtitle="hear the selected voice")
-        self.preview_spin = Adw.Spinner(visible=False, valign=Gtk.Align.CENTER)
+        self.preview_spin = spinner(visible=False, valign=Gtk.Align.CENTER)
         self.preview_btn = button("play", "kivi-ghost", icon="media-playback-start-symbolic",
                                   on_click=self._preview_voice)
         prev.add_suffix(self.preview_spin)
@@ -1277,7 +1298,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         ex = vbox(12)
         ex.append(label("START FROM A PERSONA", "kivi-eyebrow"))
-        chips = Adw.WrapBox(child_spacing=8, line_spacing=8)
+        chips = wrap_box(8)
         self.persona_quote = label("", "kivi-quote", wrap=True)
         for name, text in PERSONAS:
             chip = button(name, "kivi-chip", tooltip=text, on_click=lambda t=text: buf.set_text(t))
@@ -1316,7 +1337,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.word_count = label("", "kivi-dim")
         head.append(self.word_count)
         card.append(head)
-        self.words_box = Adw.WrapBox(child_spacing=8, line_spacing=8)
+        self.words_box = wrap_box(8)
         card.append(self.words_box)
         self.words_empty = label("nothing yet. add a name above, or say “hey kivi, remember Siddharth”.",
                                  "kivi-dim", wrap=True)
@@ -1451,7 +1472,7 @@ class SettingsWindow(Adw.ApplicationWindow):
                   "“type a polite reply saying i'll be ten minutes late”",
                   "“what's this error mean?” with text selected"):
             card.append(label(q, "kivi-quote", wrap=True))
-        can = Adw.WrapBox(child_spacing=6, line_spacing=6, margin_top=6)
+        can = wrap_box(6, margin_top=6)
         for c in ("types for you", "opens sites", "launches apps", "copies things", "reads your selection",
                   "remembers words"):
             can.append(label(c, "kivi-chip", "green"))
