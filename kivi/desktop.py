@@ -19,6 +19,36 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=5, **kw)
 
 
+def wayland() -> bool:
+    return bool(os.environ.get("WAYLAND_DISPLAY"))
+
+
+# ---------------------------------------------------------------- packages
+
+# kivi's names for what it needs -> the package that provides it, per package manager
+_PACKAGES = {
+    "apt": {"evdev": "python3-evdev", "gtk4": "python3-gi gir1.2-gtk-4.0", "adwaita": "gir1.2-adw-1",
+            "layer-shell": "gir1.2-gtk4layershell-1.0", "wl-clipboard": "wl-clipboard", "xclip": "xclip"},
+    "dnf": {"evdev": "python3-evdev", "gtk4": "python3-gobject gtk4", "adwaita": "libadwaita",
+            "layer-shell": "gtk4-layer-shell", "wl-clipboard": "wl-clipboard", "xclip": "xclip"},
+    "pacman": {"evdev": "python-evdev", "gtk4": "python-gobject gtk4", "adwaita": "libadwaita",
+               "layer-shell": "gtk4-layer-shell", "wl-clipboard": "wl-clipboard", "xclip": "xclip"},
+}
+_INSTALL = {"apt": "sudo apt install", "dnf": "sudo dnf install", "pacman": "sudo pacman -S --needed"}
+
+
+def package_manager() -> str | None:
+    return next((pm for pm in ("apt", "dnf", "pacman") if shutil.which(pm)), None)
+
+
+def install_cmd(*needs) -> str:
+    """The command that installs kivi's `needs` (e.g. "evdev", "xclip") on this distro."""
+    pm = package_manager()
+    names = _PACKAGES.get(pm, {})
+    pkgs = " ".join(dict.fromkeys(p for n in needs for p in names.get(n, n).split()))
+    return f"{_INSTALL[pm]} {pkgs}" if pm else f"install: {pkgs}"
+
+
 def _spawn(cmd):
     """Start a program fully detached from kivi."""
     subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -62,26 +92,45 @@ def _has_klipper():
 
 
 class Clipboard:
-    """wl-clipboard if installed, else KDE Klipper over D-Bus, else xclip.
+    """wl-clipboard on Wayland, xclip on X11, else KDE Klipper over D-Bus.
 
     Text is always handed over on stdin (or D-Bus), never in argv: argv is world-readable in
     /proc and limited to 128 KiB per argument.
     """
 
     def _backend(self):
-        if shutil.which("wl-paste") and shutil.which("wl-copy"):
-            return "wl"
+        # wl-clipboard is often installed on X11 desktops too, where it can't reach any clipboard
+        if wayland():
+            if shutil.which("wl-paste") and shutil.which("wl-copy"):
+                return "wl"
+        elif shutil.which("xclip"):
+            return "xclip"
         if _has_klipper():
             return "klipper"
         if shutil.which("xclip"):
             return "xclip"
-        raise RuntimeError("no clipboard tool: install wl-clipboard")
+        raise RuntimeError("no clipboard tool: install " + ("wl-clipboard" if wayland() else "xclip"))
+
+    def _read(self, mime) -> subprocess.CompletedProcess:
+        if self._backend() == "wl":
+            return subprocess.run(["wl-paste", "-n", "-t", mime], capture_output=True, timeout=5)
+        return subprocess.run(["xclip", "-o", "-sel", "clip", "-t", mime], capture_output=True, timeout=5)
+
+    def _write(self, mime, data: bytes) -> None:
+        # both fork a server that keeps the pipes open; don't capture its output
+        cmd = ["wl-copy", "-t", mime] if self._backend() == "wl" else ["xclip", "-sel", "clip", "-t", mime]
+        subprocess.run(cmd, input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=True)
 
     def types(self) -> list[str]:
         """MIME types currently offered ([] if empty or unknown)."""
-        if self._backend() != "wl":
+        b = self._backend()
+        if b == "wl":
+            p = subprocess.run(["wl-paste", "-l"], capture_output=True, text=True, timeout=5)
+        elif b == "xclip":
+            p = subprocess.run(["xclip", "-o", "-sel", "clip", "-t", "TARGETS"], capture_output=True, text=True,
+                               timeout=5)
+        else:
             return []
-        p = subprocess.run(["wl-paste", "-l"], capture_output=True, text=True, timeout=5)
         return [t.strip() for t in p.stdout.splitlines() if t.strip()] if p.returncode == 0 else []
 
     def get(self) -> str:
@@ -92,7 +141,7 @@ class Clipboard:
             return p.stdout.decode("utf-8", errors="replace") if p.returncode == 0 else ""
         if b == "klipper":
             return _klipper("getClipboardContents") or ""
-        p = subprocess.run(["xclip", "-o", "-sel", "clip"], capture_output=True, timeout=5)
+        p = self._read("UTF8_STRING")
         return p.stdout.decode("utf-8", errors="replace") if p.returncode == 0 else ""
 
     def set(self, text: str) -> None:
@@ -104,7 +153,8 @@ class Clipboard:
         elif b == "klipper":
             _klipper("setClipboardContents", text)
         else:
-            subprocess.run(["xclip", "-sel", "clip"], input=text.encode("utf-8"), timeout=5, check=True)
+            subprocess.run(["xclip", "-sel", "clip"], input=text.encode("utf-8"), stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5, check=True)
 
     def clear(self) -> None:
         b = self._backend()
@@ -119,7 +169,7 @@ class Clipboard:
         """Save the clipboard so it can be put back; None = don't touch it afterwards
         (a password-manager secret, or something kivi can't read faithfully)."""
         b = self._backend()
-        if b != "wl":
+        if b not in ("wl", "xclip"):
             text = self.get()
             return Snapshot("text/plain;charset=utf-8", text.encode("utf-8")) if text else None
         types = self.types()
@@ -133,7 +183,7 @@ class Clipboard:
         mime = mime or next((t for t in types if "/" in t), None)
         if mime is None:
             return None
-        p = subprocess.run(["wl-paste", "-n", "-t", mime], capture_output=True, timeout=5)
+        p = self._read(mime)
         if p.returncode != 0 or len(p.stdout) > _SNAPSHOT_LIMIT:
             return None
         return Snapshot(mime, p.stdout)
@@ -141,11 +191,10 @@ class Clipboard:
     def restore(self, snap: Snapshot) -> None:
         if snap.mime is None:
             self.clear()
-        elif snap.mime in _TEXT_TYPES or self._backend() != "wl":
-            self.set(snap.data.decode("utf-8", errors="replace"))  # wl-copy offers all text aliases
+        elif snap.mime in _TEXT_TYPES or self._backend() not in ("wl", "xclip"):
+            self.set(snap.data.decode("utf-8", errors="replace"))  # wl-copy/xclip offer all text aliases
         else:
-            subprocess.run(["wl-copy", "-t", snap.mime], input=snap.data, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=5, check=True)
+            self._write(snap.mime, snap.data)
 
     def safe_get(self) -> str | None:
         try:
@@ -388,6 +437,8 @@ def launch_app(name) -> bool:
                 _spawn(["gtk-launch", desktop_id])
             elif shutil.which("kioclient"):
                 _spawn(["kioclient", "exec", path])
+            elif shutil.which("gio"):
+                _spawn(["gio", "launch", path])
             else:
                 return False
             return True
@@ -423,15 +474,23 @@ def uinput_ok() -> bool:
     return os.access("/dev/uinput", os.R_OK | os.W_OK)
 
 
-_TYPELIB_DIRS = ["/usr/lib/girepository-1.0", "/usr/lib64/girepository-1.0",
-                 "/usr/local/lib/girepository-1.0", "/usr/lib/x86_64-linux-gnu/girepository-1.0"]
+_TYPELIB_DIRS = ["/usr/lib/girepository-1.0", "/usr/lib64/girepository-1.0", "/usr/local/lib/girepository-1.0",
+                 *sorted(glob.glob("/usr/lib/*-linux-gnu/girepository-1.0"))]
 _LAYER_SHELL_LIBS = ["/usr/lib/libgtk4-layer-shell.so", "/usr/lib/libgtk4-layer-shell.so.0",
-                     "/usr/lib64/libgtk4-layer-shell.so.0", "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0"]
+                     "/usr/lib64/libgtk4-layer-shell.so.0",
+                     *sorted(glob.glob("/usr/lib/*-linux-gnu/libgtk4-layer-shell.so.0"))]
 
 
 def layer_shell_lib() -> str | None:
     """Path of the gtk4-layer-shell shared library (for LD_PRELOAD), or None."""
     return next((p for p in _LAYER_SHELL_LIBS if os.path.exists(p)), None)
+
+
+def clipboard_ok() -> bool:
+    """The clipboard tool for this session is installed (wl-clipboard on Wayland, xclip on X11)."""
+    if wayland():
+        return bool(shutil.which("wl-copy") and shutil.which("wl-paste"))
+    return bool(shutil.which("xclip"))
 
 
 def layer_shell_available() -> bool:

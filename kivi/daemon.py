@@ -14,7 +14,6 @@ log = logging.getLogger("kivi")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KIVI_BIN = os.path.join(ROOT, "bin", "kivi")
-LAYER_SHELL_LIB = "/usr/lib/libgtk4-layer-shell.so"
 PRELOAD_GUARD = "KIVI_PRELOADED"
 APP_ID = "ai.kivi.Linux.Daemon"
 
@@ -29,12 +28,14 @@ TRAY_STATES = {"listening": "listening", "thinking": "thinking", "heard": "think
 
 def _preload_layer_shell():
     """gtk4-layer-shell must be loaded before libwayland-client, so re-exec ourselves with LD_PRELOAD."""
-    if os.environ.get(PRELOAD_GUARD) or not os.path.exists(LAYER_SHELL_LIB):
+    from kivi import desktop
+    lib = desktop.layer_shell_lib()
+    if os.environ.get(PRELOAD_GUARD) or not lib or not desktop.wayland():
         return
     preload = os.environ.get("LD_PRELOAD", "")
-    if LAYER_SHELL_LIB in preload.split():
+    if lib in preload.split():
         return
-    env = dict(os.environ, LD_PRELOAD=f"{LAYER_SHELL_LIB} {preload}".strip(), **{PRELOAD_GUARD: "1"})
+    env = dict(os.environ, LD_PRELOAD=f"{lib} {preload}".strip(), **{PRELOAD_GUARD: "1"})
     sys.stdout.flush()
     sys.stderr.flush()
     try:
@@ -229,7 +230,7 @@ class Daemon:
         """Notifications stand in for the pill only when it can't be seen.
 
         Pill working: never. Pill turned off by the user: if "notifications" is on.
-        Pill wanted but broken (no layer-shell/KWin): always, or kivi would be invisible.
+        Pill wanted but broken (no layer-shell/KWin/X11 placement): always, or kivi would be invisible.
         """
         if self._overlay_live() and getattr(self.overlay, "available", True):
             return False
@@ -473,11 +474,8 @@ class Daemon:
         log.info("config reloaded")
         return False
 
-    def _layer_shell(self):
-        if self.overlay is not None and hasattr(self.overlay, "backend"):
-            return self.overlay.backend == "layer-shell"
-        from kivi import desktop
-        return desktop.layer_shell_available() and LAYER_SHELL_LIB in os.environ.get("LD_PRELOAD", "")
+    def _pill_backend(self):
+        return getattr(self.overlay, "backend", None) if self.overlay is not None else None
 
     # ------------------------------------------------------------ ipc (server thread)
 
@@ -488,7 +486,8 @@ class Daemon:
         if cmd == "status":
             return {"ok": True, "state": getattr(self.engine, "state", "idle"),
                     "devices": list(getattr(self.listener, "devices", []) or []),
-                    "layer_shell": self._layer_shell(), "paused": self.paused}
+                    "layer_shell": self._pill_backend() == "layer-shell", "pill": self._pill_backend(),
+                    "paused": self.paused}
         if cmd == "reload":
             GLib.idle_add(self.reload)
             return {"ok": True}
