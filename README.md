@@ -8,6 +8,11 @@ focus. It works in Hindi, Hinglish, English and the other Indian languages `saar
 A small pill sits on your desktop and shows you what kivi is doing. It also hosts a voice agent that
 can open things and type for you.
 
+> **credits:** kivi-linux was created by **[prasoondev](https://github.com/prasoondev)** for Arch Linux and
+> KDE Plasma ([prasoondev/kivi-linux](https://github.com/prasoondev/kivi-linux)). The daemon, the pill,
+> the voice agent, the settings app, the tray icon and the installer are all their work. This fork adds
+> Ubuntu and Lubuntu (LXQt on X11) support. See [credits](#credits) below.
+
 <p align="center">
   <img src="docs/screenshots/settings-home.png" width="720" alt="kivi settings app, home page">
 </p>
@@ -40,7 +45,8 @@ copy throughout.
 
 kivi's always-on face. It sits at the bottom centre of your screen, above every window, and never takes
 keyboard focus, so your text still lands in the app you were using. On KDE it uses `gtk4-layer-shell`,
-and falls back to a KWin script if that isn't installed.
+and falls back to a KWin script if that isn't installed. On other X11 desktops (Lubuntu's LXQt/Openbox,
+Xfce, MATE, ...) it's a dock window that stays above everything and follows your mouse between monitors.
 
 <p align="center">
   <img src="docs/screenshots/pill-states.png" width="480" alt="pill states: idle, listening, thinking, you said, done, error">
@@ -64,8 +70,8 @@ and **error**.
 
 ### tray icon
 
-kivi also sits in the system tray (StatusNotifierItem, so it works with Plasma, waybar and GNOME's
-AppIndicator extension). The icon follows what kivi is doing:
+kivi also sits in the system tray (StatusNotifierItem, so it works with Plasma, the LXQt panel, waybar
+and GNOME's AppIndicator extension). The icon follows what kivi is doing:
 
 <p align="center">
   <img src="docs/screenshots/tray-states.png" width="420" alt="tray icon states: idle, listening, thinking, speaking, paused, error">
@@ -102,26 +108,41 @@ it stays on your machine.
 ## install
 
 ```sh
+git clone https://github.com/jugalkkt/kivi-linux.git
+cd kivi-linux
 ./install.sh
 ```
 
 This links `kivi` into `~/.local/bin`, adds the app icon and menu entry, and starts the `kivi` systemd user
-service. When it finishes it prints the one `sudo` line you still need (if any), usually:
+service. If Python packages are missing it stops first and prints the install command for your distro
+(apt, dnf or pacman). On Ubuntu / Lubuntu that's:
 
 ```sh
-sudo pacman -S --needed gtk4-layer-shell wl-clipboard && sudo usermod -aG input $USER
+sudo apt install python3-evdev python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 xclip
+```
+
+When it finishes it prints the one `sudo` line you still need (if any), usually:
+
+```sh
+sudo usermod -aG input $USER          # plus a udev rule for /dev/uinput, printed in full
 ```
 
 The `input` group lets kivi see your hotkeys. Log out and back in after joining it, or run
 `sudo setfacl -m u:$USER:rw /dev/input/event*` to get access now (it lasts until reboot). Without
 it, kivi still works through the pill or `kivi toggle`, which you can bind to any shortcut in system settings.
-`gtk4-layer-shell` is optional and gives a cleaner always-on-top pill. `wl-clipboard` is optional too.
+On Wayland, `gtk4-layer-shell` is optional and gives a cleaner always-on-top pill, and `wl-clipboard`
+is optional too. On X11 kivi needs `xclip` for the clipboard.
+
+kivi starts at login through systemd's `graphical-session.target`. LXQt, Xfce and some other desktops never
+start that target, so the installer also adds `~/.config/autostart/ai.kivi.Linux.desktop`. It starts the
+service unless you've turned off **launch at login**.
 
 Put your Sarvam API key in **kivi settings → api key**. It's stored in `~/.config/kivi/api_key` (chmod 600).
 You can also set `$SARVAM_API_KEY`.
 
-Requirements: KDE Plasma 6 on Wayland is the main target. X11 and GNOME work with a plainer pill.
-You also need pipewire, python-evdev, gtk4 and libadwaita.
+Requirements: KDE Plasma 6 on Wayland is the main target. Lubuntu (LXQt on X11) and other X11 desktops
+are supported, and GNOME works with a plainer pill. You also need pipewire, python-evdev, gtk4 and
+libadwaita 1.5 or newer (Ubuntu 24.04 and later).
 
 ## uninstall
 
@@ -131,7 +152,7 @@ You also need pipewire, python-evdev, gtk4 and libadwaita.
 ```
 
 This stops and disables the `kivi` service, then removes the `kivi` command, the menu entry, the icons,
-the fonts kivi installed and its runtime files. With `--purge` it also deletes `~/.config/kivi` and
+the autostart entry, the fonts kivi installed and its runtime files. With `--purge` it also deletes `~/.config/kivi` and
 `~/.local/share/kivi`. Nothing needs `sudo`.
 
 It then prints the system-wide steps to undo by hand, if you did them and nothing else needs them:
@@ -177,3 +198,19 @@ go to seeing text. The agent uses Sarvam chat with tools, and speaks through `bu
 - Sarvam's synchronous speech-to-text takes clips up to about 30 s, so kivi stops listening at 29 s.
 - Terminals want `paste_keys = "ctrl+shift+v"`. Per-app paste keys aren't supported yet.
 - Clipboard managers will see each dictation.
+
+## credits
+
+- **[prasoondev](https://github.com/prasoondev)** wrote kivi-linux: the original project,
+  [prasoondev/kivi-linux](https://github.com/prasoondev/kivi-linux), built for Arch Linux and KDE Plasma 6 on
+  Wayland. Everything up to the uninstaller in this repo's history is their work.
+- **[Jugal](https://github.com/jugalkkt)** ported it to Ubuntu and Lubuntu:
+  - LXQt/Openbox (and other X11 window manager) support for the pill
+  - an xclip clipboard on X11 that saves and restores your clipboard, images included
+  - starting at login on desktops without systemd's graphical session
+  - apt/dnf/pacman-aware install hints
+  - libadwaita 1.5 fallbacks for Ubuntu 24.04
+  - a hotkey fix for Python 3.13
+
+kivi itself is [heykivi.ai](https://heykivi.ai); this is an unofficial Linux take on it. Speech and language
+models are by [Sarvam AI](https://sarvam.ai).

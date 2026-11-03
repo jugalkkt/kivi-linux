@@ -1,6 +1,6 @@
 # kivi-linux architecture (v2)
 
-A Linux (KDE Plasma 6, Wayland; must also degrade gracefully on X11/GNOME) clone of heykivi.ai,
+A Linux (KDE Plasma 6, Wayland; also Lubuntu/LXQt and other X11 desktops; degrades gracefully on GNOME) clone of heykivi.ai,
 powered by Sarvam AI. Python 3.14 **system python only** — no pip. Available system modules:
 `evdev` (python-evdev 2.0), `gi` with Gtk 4.24 + Adw 1.10, stdlib. Optional at runtime:
 `gtk4-layer-shell` (typelib `Gtk4LayerShell-1.0`, lib `/usr/lib/libgtk4-layer-shell.so`) — NOT
@@ -46,7 +46,7 @@ kivi-linux/
   kivi/agent.py            # voice agent: tools + conversation memory
   kivi/ipc.py              # unix-socket server (daemon) + client (CLI/settings)
   kivi/theme.py            # shared CSS (kivi look) for overlay + settings
-  kivi/overlay.py          # always-on desktop pill (GTK4, layer-shell or KWin fallback)
+  kivi/overlay.py          # always-on desktop pill (GTK4: layer-shell, KWin script, or X11/EWMH placement)
   kivi/daemon.py           # Gtk.Application wiring hotkeys+engine+overlay+ipc
   kivi/settings.py         # Adw manager app ("kivi settings")
   data/kivi.svg            # original icon (NOT Kivi's logo): dark rounded square #0b0e0a with 5 green #a8e063 bars
@@ -127,7 +127,7 @@ Level = clamp(rms/3000, 0, 1) smoothed, so the overlay bars dance with the voice
 
 ### desktop.py
 ```python
-class Clipboard: get()->str ; set(text)        # wl-clipboard > qdbus6 klipper > xclip (port from v1)
+class Clipboard: get()->str ; set(text)        # Wayland: wl-clipboard > klipper; X11: xclip (full mime snapshot) > klipper
 class Keyboard: combo("ctrl+v")                # python-evdev UInput named "kivi-virtual-keyboard"; create once
 def insert_text(kbd, clip, text, paste_keys="ctrl+v", restore=True) -> None   # v1 insert logic
 def selected_text(kbd, clip) -> str            # sentinel + ctrl+c logic from v1 ("" if none)
@@ -230,7 +230,10 @@ class Overlay:
   "kivi-overlay"; then load a KWin script over D-Bus (`org.kde.KWin /Scripting loadScript(path, name)` then
   `/Scripting/Script<N> run`, or `org.kde.kwin.Scripting`) that finds the window by caption and sets keepAbove, skipTaskbar,
   skipPager, skipSwitcher, onAllDesktops, noBorder and moves it to bottom-center of its output; also make the window
-  input-transparent except the pill area if possible. Any other env: plain undecorated window + notifications fallback.
+  input-transparent except the pill area if possible. Other X11 WMs (Openbox, Xfwm, ...): `X11Placer` sets
+  `_NET_WM_WINDOW_TYPE_DOCK`, above/sticky/skip-taskbar states, WM_HINTS input=False without WM_TAKE_FOCUS, and
+  XMoveWindow to the work area of the monitor under the pointer (ctypes libX11 on its own connection); with no
+  compositor the window is XShape-clipped to the pill and card. Any other env: plain undecorated window + notifications fallback.
   The overlay must never steal keyboard focus (focus would break pasting into the user's app).
 - Transparent background: window CSS `background: transparent`; only the pill draws.
 
